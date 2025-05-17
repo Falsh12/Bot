@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ВАЖНО ДЛЯ GOOGLE COLAB:
+# Перед запуском этого скрипта в Google Colab, выполните в отдельной ячейке:
+!sudo apt-get update && sudo apt-get install -y libxcb-cursor0
+# Затем устанавливаем Calibre
+!sudo -v && wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh | sudo sh /dev/stdin
+# Установка зависимостей Python (если еще не установлены)
+!pip install python-docx docxcompose beautifulsoup4 ebooklib aiogram aiofiles nest_asyncio
+
+import os
+import re
+import time
+import docx # Остается для создания "ошибочных" DOCX и для check_and_add_title
+import aiogram
+from docx import Document # Используется для создания пустых/ошибочных документов
+from docx.shared import Inches # Может понадобиться если check_and_add_title будет работать с картинками
+# PIL, base64, posixpath, ebooklib, BeautifulSoup - больше не нужны для основной конвертации, но могут быть полезны для check_and_add_title или других будущих фич
+from docxcompose.composer import Composer
+from aiogram import Bot, Router, types, F, Dispatcher
+from aiogram.types import Message, FSInputFile, BotCommand, BotCommandScopeDefault, BotCommandScopeAllGroupChats
+from aiogram.filters import Command
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+# from aiogram.utils import markdown as md # Не используется явно
+import aiofiles
+import asyncio
+import nest_asyncio
+import concurrent.futures
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from functools import partial
+from collections import deque
+from datetime import datetime, timezone, timedelta
+nest_asyncio.apply()
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardRemove
+from aiogram.exceptions import TelegramBadRequest
+import subprocess # Для вызова Calibre
+
+# Создаем пул потоков для выполнения CPU-bound задач (включая Calibre)
+thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+# --- Настройки Calibre ---
+CALIBRE_CONVERT_PATH = "/opt/calibre/ebook-convert"
+IS_CALIBRE_AVAILABLE = False
+
+async def check_calibre_availability():
+    """Проверяет доступность Calibre при запуске бота."""
+    global IS_CALIBRE_AVAILABLE
+    if os.path.exists(CALIBRE_CONVERT_PATH) and os.access(CALIBRE_CONVERT_PATH, os.X_OK):
+        try:
+            process = await asyncio.create_subprocess_exec(
+                CALIBRE_CONVERT_PATH, '--version',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await process.communicate()
+            if process.returncode == 0:
+                IS_CALIBRE_AVAILABLE = True
+                print(f"Calibre найден и работает: {CALIBRE_CONVERT_PATH}")
+                print(f"Версия Calibre: {stdout.decode(errors='ignore').strip()}")
+            else:
+                print(f"Calibre найден ({CALIBRE_CONVERT_PATH}), но команда --version не удалась. Stderr: {stderr.decode(errors='ignore')}")
+                IS_CALIBRE_AVAILABLE = False
+        except Exception as e:
+            print(f"Ошибка при проверке Calibre: {e}")
+            IS_CALIBRE_AVAILABLE = False
+    else:
+        print(f"Calibre (ebook-convert) не найден или не исполняемый по пути {CALIBRE_CONVERT_PATH}.")
+        IS_CALIBRE_AVAILABLE = False
+
+async def set_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start_merge", description="Начать сбор файлов"),
+        BotCommand(command="end_merge", description="Завершить сбор и объединить"),
+        BotCommand(command="cancel", description="Отменить сбор"),
+        BotCommand(command="queue_status", description="Статус очереди задач"),
+        BotCommand(command="limits", description="Проверить лимиты"),
+        BotCommand(command="info", description="Информация о боте и команды"),
+    ]
+    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+
+async def sanitize_filename(file_name):
+    replacement = '_'
+    invalid_chars_pattern = r'[<>:"/|\?*]'
+    sanitized = re.sub(invalid_chars_pattern, replacement, file_name)
+    max_len = 250
+    return sanitized[:max_len]
+
+async def check_sender(message: types.Message):
+    if message.sender_chat:
+        bot_message = await message.reply("Анонимные пользователи (от имени каналов/групп) не могут использовать этого бота.")
+        asyncio.create_task(delete_message_after_delay(bot_message, delay=5))
+        return True
+    return False
+
+async def delete_message_after_delay(message: types.Message, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+    except Exception as e:
+        print(f"Не удалось удалить сообщение {message.message_id}: {e}")
+
+async def del_msg(chat_id, list_delete_message):
+    for msg_id in list_delete_message:
+        try:
+           await bot.delete_message(chat_id, msg_id)
+           await asyncio.sleep(0.1)
+        except TelegramBadRequest: pass
+        except Exception as e: print(f"Ошибка удаления сообщения {msg_id}: {e}")
+
+class UserLimits:
+    def __init__(self, max_files, max_size):
+        self.user_data = {}
+        self.last_global_reset = self._get_last_utc_midnight()
+        self.user_locks = {}
+        self.max_files = max_files
+        self.max_size = max_size
+
+    def _get_last_utc_midnight(self):
+        now = datetime.now(timezone.utc)
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def get_lock(self, user_id):
+        if user_id not in self.user_locks:
+            self.user_locks[user_id] = asyncio.Lock()
+        return self.user_locks[user_id]
+
+    def check_limits(self, user_id, file_size):
+        now = datetime.now(timezone.utc)
+        if now > self.last_global_reset + timedelta(days=1):
+            self.user_data.clear()
+            self.last_global_reset = self._get_last_utc_midnight()
+        if user_id not in self.user_data:
+            self.user_data[user_id] = {'files_today': 0}
+        if file_size > self.max_size * 1024 * 1024:
+            return False, f"❌ Размер файла превышает {self.max_size} MB."
+        if self.user_data[user_id]['files_today'] >= self.max_files: # Исправлено == на >=
+            time_left = (self.last_global_reset + timedelta(days=1)) - now
+            hours_left = time_left.seconds // 3600
+            minutes_left = (time_left.seconds % 3600) // 60
+            return False, f"❌ Лимит исчерпан ({self.max_files}/{self.max_files}). Сброс через {hours_left} ч. {minutes_left} мин. (в 00:00 UTC)."
+        return True, ""
+
+    def increment_counter(self, user_id):
+        self.user_data[user_id]['files_today'] += 1
+
+    def discrement_counter(self, user_id, count): # decrement
+        if user_id in self.user_data:
+            self.user_data[user_id]['files_today'] = max(0, self.user_data[user_id]['files_today'] - count)
+
+
+user_limits = UserLimits(max_files=30, max_size=15) # Макс. размер 15МБ для Calibre может быть маловат
+
+class TaskQueue:
+    def __init__(self, max_concurrent_tasks):
+        self.queue = deque()
+        self.active_tasks = {}
+        self.max_concurrent_tasks = max_concurrent_tasks
+        self.task_counter = 0
+
+    def add_task(self, user_id, chat_id, message_thread_id, is_forum, file_list, output_file_name):
+        self.task_counter += 1
+        task_id = self.task_counter
+        task = {
+            'user_id': user_id, 'chat_id': chat_id, 'message_thread_id': message_thread_id,
+            'is_forum': is_forum, 'file_list': file_list, 'output_file_name': output_file_name,
+            'task_id': task_id, 'time_added': time.time(), 'list_delete_message': []
+        }
+        self.queue.append(task)
+        return task, len(self.queue)
+
+    def get_next_task(self):
+        if not self.queue: return None
+        task = self.queue.popleft()
+        self.active_tasks[task['task_id']] = task
+        return task
+
+    def complete_task(self, task_id):
+        if task_id in self.active_tasks:
+            del self.active_tasks[task_id]
+
+    def get_user_tasks(self, user_id):
+        tasks = [t for t_id, t in self.active_tasks.items() if t['user_id'] == user_id]
+        tasks.extend([t for t in self.queue if t['user_id'] == user_id])
+        return tasks
+
+    def can_process_now(self):
+        return len(self.active_tasks) < self.max_concurrent_tasks and self.queue
+
+task_queue = TaskQueue(max_concurrent_tasks=1)
+
+def timer(func):
+    async def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = await func(*args, **kwargs)
+        elapsed = time.time() - start_time
+        print(f"[PROFILING] Функция {func.__name__} выполнилась за {elapsed:.2f} секунд")
+        return result
+    return wrapper
+
+API_TOKEN = '7885126039:AAEzZPYvJhN2rncjtSiYPGa194cDEcZODyE'
+bot = Bot(token=API_TOKEN)
+router = Router()
+
+async def run_in_threadpool(func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    func_partial = partial(func, *args, **kwargs)
+    return await loop.run_in_executor(thread_pool, func_partial)
+
+# --- Новая функция конвертации через Calibre ---
+async def convert_file_to_docx_with_calibre(input_file, docx_file, ext):
+    """Конвертирует файл в DOCX с помощью Calibre."""
+    def _convert_sync():
+        if not IS_CALIBRE_AVAILABLE:
+            print(f"Ошибка: Calibre недоступен. Не удалось конвертировать {os.path.basename(input_file)}")
+            error_doc = Document()
+            error_doc.add_paragraph(f"Ошибка: Сервис конвертации Calibre временно недоступен. Не удалось обработать файл: {os.path.basename(input_file)}")
+            error_doc.save(docx_file)
+            return False # Индикация ошибки
+
+        command = [CALIBRE_CONVERT_PATH, input_file, docx_file, "--docx-no-toc"]
+        if ext == ".fb2":
+            command.append("--no-inline-fb2-toc")
+        # Опции Calibre для улучшения конвертации в DOCX (можно настроить)
+        # command.extend(["--docx-page-size", "a4"]) # Пример
+
+        try:
+            # Увеличим таймаут, т.к. Calibre может долго работать с большими файлами
+            result = subprocess.run(command, capture_output=True, text=True, errors='ignore', check=False, timeout=600) # 10 минут
+
+            if result.returncode != 0:
+                print(f"Ошибка конвертации Calibre для файла {input_file} (код {result.returncode}):")
+                # print(f"STDOUT: {result.stdout}") # Часто здесь много мусора
+                print(f"STDERR: {result.stderr}")
+                error_doc = Document()
+                error_message = f"Ошибка конвертации файла {os.path.basename(input_file)} с помощью Calibre.\n"
+                if result.stderr:
+                    error_message += "Сообщение от Calibre (фрагмент):\n" + result.stderr[:1500]
+                else:
+                    error_message += "Calibre не предоставил детальной информации об ошибке."
+                error_doc.add_paragraph(error_message)
+                error_doc.save(docx_file)
+                return False
+            print(f"Файл {input_file} успешно сконвертирован в {docx_file} с помощью Calibre.")
+            return True
+        except subprocess.TimeoutExpired:
+            print(f"Ошибка: Конвертация файла {input_file} с помощью Calibre заняла слишком много времени (>10 мин).")
+            error_doc = Document()
+            error_doc.add_paragraph(f"Ошибка: Обработка файла {os.path.basename(input_file)} заняла слишком много времени и была прервана.")
+            error_doc.save(docx_file)
+            return False
+        except Exception as e:
+            print(f"Критическая ошибка при вызове Calibre для {input_file}: {e}")
+            error_doc = Document()
+            error_doc.add_paragraph(f"Критическая системная ошибка при конвертации файла {os.path.basename(input_file)}: {e}")
+            error_doc.save(docx_file)
+            return False
+
+    return await run_in_threadpool(_convert_sync)
+
+
+@timer
+async def process_files(file_list):
+    converted_files = []
+    # Поддерживаемые Calibre форматы для конвертации в DOCX (можно расширить)
+    CALIBRE_SUPPORTED_INPUT_EXT = (".docx", ".txt", ".fb2", ".epub", ".mobi", ".azw3", ".rtf", ".html", ".htm", ".lit")
+
+    for file_path in file_list:
+        base_name, ext = os.path.splitext(file_path)
+        ext = ext.lower()
+
+        #if ext == ".docx":
+            #converted_files.append(file_path)
+        if ext in CALIBRE_SUPPORTED_INPUT_EXT:
+            docx_file = base_name + "1" + ".docx"
+            # Конвертируем с помощью Calibre
+            success = await convert_file_to_docx_with_calibre(file_path, docx_file, ext)
+            # Добавляем файл в любом случае (успешный или с ошибкой),
+            # чтобы пользователь видел результат или проблему.
+            converted_files.append(docx_file)
+        else:
+            print(f"Неподдерживаемый формат файла: {file_path}. Будет создан DOCX с сообщением.")
+            docx_file = base_name + "_unsupported_format.docx"
+            error_doc = Document()
+            error_doc.add_paragraph(f"Файл '{os.path.basename(file_path)}' имеет формат, который не поддерживается для автоматической конвертации.")
+
+            # Сохранение в потоке, так как Document.save() может быть блокирующим
+            def _save_error_doc_sync():
+                error_doc.save(docx_file)
+            await run_in_threadpool(_save_error_doc_sync)
+            converted_files.append(docx_file)
+
+    return converted_files
+
+# ===================== Функция добавления заголовка (остается без изменений) =====
+def check_and_add_title(doc, file_name):
+    patterns = [
+        r'Глава[ ]{0,4}\d{1,4}', r'Часть[ ]{0,4}\d{1,4}', r'Пролог[ .!]*',
+        r'Описание[ .!]*', r'Аннотация[ .!]*', r'Annotation[ .!]*',
+        r'Предисловие от автора[ .!]*'
+    ]
+    if doc.paragraphs:
+        check_paragraphs = doc.paragraphs[0:min(4, len(doc.paragraphs))] # Защита от коротких док-ов
+        title_found = False
+        for p in check_paragraphs:
+            if any(p.style.name.lower().startswith(prefix) for prefix in ["heading", "заголовок"]):
+                title_found = True; break
+        if not title_found:
+            for p in check_paragraphs:
+                for pattern in patterns:
+                    if re.fullmatch(pattern, p.text.strip(), re.IGNORECASE): # Добавил IGNORECASE
+                        title_found = True; break
+                if title_found: break
+        if not title_found:
+            title = os.path.splitext(os.path.basename(file_name))[0]
+            if re.fullmatch(r'\d+', title.strip()): title = 'Глава ' + title
+            try:
+                heading = doc.add_heading(title, level=1)
+                doc._body._element.insert(0, heading._element)
+            except Exception as e:
+                try: # Запасной вариант, если вставка сломалась
+                    paragraph = doc.paragraphs[0].insert_paragraph_before(title)
+                    paragraph.style = 'Heading 1' # Попытка применить стиль
+                except Exception as e_inner:
+                     print(f"Возникла ошибка при добавлении заголовка (основная и запасная): {e}, {e_inner}")
+
+    return doc
+
+@timer
+async def merge_docx(file_list, output_file_name):
+    def _merge():
+        merged_document = Document()
+        composer = Composer(merged_document)
+        try:
+            for file_path in file_list:
+                try:
+                    # Проверяем, существует ли файл и не пустой ли он (Calibre мог создать пустой файл при ошибке)
+                    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                        doc = Document(file_path)
+                        doc = check_and_add_title(doc, file_path)
+                        composer.append(doc)
+                    else:
+                        # Файл не существует или пуст (возможно, ошибка конвертации)
+                        # Добавляем информацию об этом в итоговый документ
+                        error_paragraph_text = f"Файл '{os.path.basename(file_path)}' не был добавлен из-за ошибки конвертации или отсутствия файла."
+                        if not os.path.exists(file_path):
+                             error_paragraph_text = f"Файл '{os.path.basename(file_path)}' не найден и не был добавлен."
+                        print(error_paragraph_text)
+                        merged_document.add_paragraph(error_paragraph_text)
+
+                except Exception as e:
+                    print(f"Ошибка добавления файла {file_path} в итоговый документ: {e}")
+                    merged_document.add_paragraph(f"Ошибка при обработке файла {os.path.basename(file_path)}: {e}")
+        except Exception as e:
+            print(f"Критическая ошибка при объединении файлов {file_list}: {e}")
+            merged_document.add_paragraph(f"Критическая ошибка при объединении файлов: {e}")
+        finally:
+            composer.save(output_file_name)
+            print(f"Файлы объединены в {output_file_name}")
+            return output_file_name
+    return await run_in_threadpool(_merge)
+
+# ===================== FSM: Состояния (без изменений) =====================
+class MergeStates(StatesGroup):
+    collecting = State()
+    naming_file = State()
+
+# ===================== Обработчики Telegram-бота (в основном без изменений) =====================
+@router.message(Command("start_merge"))
+async def start_merge(message: Message, state: FSMContext):
+    if await check_sender(message): return
+    current_state = await state.get_state()
+    if current_state == MergeStates.collecting.state:
+        bot_message = await message.answer("Сбор файлов уже запущен.")
+        await message.delete()
+        asyncio.create_task(delete_message_after_delay(bot_message, delay=5))
+        return
+    await state.set_state(MergeStates.collecting)
+    bot_message = await message.answer("Сбор файлов начат! Отправляйте файлы. Используйте /end_merge для завершения или /cancel для отмены.")
+    await state.update_data(file_list=[], list_delete_message=[bot_message.message_id])
+    await message.delete()
+
+def build_task_status(user_id):
+    user_tasks = task_queue.get_user_tasks(user_id)
+    if not user_tasks:
+        total_tasks_in_queue = len(task_queue.queue) # Только те что в очереди
+        active_tasks_count = len(task_queue.active_tasks)
+        text = f"У вас нет задач в очереди.\nСтатус системы: {active_tasks_count}/{task_queue.max_concurrent_tasks} активных, {total_tasks_in_queue} в очереди."
+        return text, None
+
+    tasks_info = []
+    keyboard_buttons = []
+    for i, task in enumerate(user_tasks): # Добавил enumerate для позиций
+        task_id = task['task_id']
+        task_name = os.path.basename(task['file_list'][0]) if task['file_list'] else "Без имени"
+        if len(task['file_list']) > 1: task_name += f" и еще {len(task['file_list'])-1}"
+
+        status_str = ""
+        if task_id in task_queue.active_tasks:
+            status_str = "⚙️ Выполняется (отменить невозможно)"
+        else:
+            # Ищем в очереди для определения позиции
+            # Это не совсем точно, т.к. get_user_tasks уже вернул все задачи пользователя.
+            # Правильнее было бы найти позицию задачи в self.queue, если она там есть
+            try:
+                # Находим индекс задачи в реальной очереди task_queue.queue
+                # Это может быть медленно на больших очередях, но для информативности...
+                queue_indices = [idx for idx, q_task in enumerate(task_queue.queue) if q_task['task_id'] == task_id]
+                if queue_indices:
+                    status_str = f"🕒 В очереди (позиция {queue_indices[0]+1})"
+                else: # Если задачи нет в очереди, но она и не активна (редкий случай, может быть сразу после завершения)
+                    status_str = "❔ Неизвестный статус"
+            except ValueError:
+                 status_str = "❔ Статус не определен (не в очереди)"
+
+
+        tasks_info.append(f"Задача #{task_id}: {task_name} - {status_str}")
+        if task_id not in task_queue.active_tasks and status_str.startswith("🕒"): # Только если в очереди
+            keyboard_buttons.append(InlineKeyboardButton(text=f"Отменить #{task_id}", callback_data=f"cancel_task:{task_id}")) # Изменил cancel -> cancel_task
+
+    text = "Ваши задачи:\n\n" + "\n".join(tasks_info)
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=[keyboard_buttons[i:i+2] for i in range(0<
