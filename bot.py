@@ -17,7 +17,9 @@ from bs4 import BeautifulSoup
 import ebooklib
 from ebooklib import epub
 from aiogram import Bot, Router, types, F, Dispatcher
-from aiogram.types import Message, FSInputFile, BotCommand, BotCommandScopeDefault, BotCommandScopeAllGroupChats
+from aiogram.types import Message, FSInputFile, BotCommand, BotCommandScopeDefault, BotCommandScopeAllGroupChats, CallbackQuery
+
+
 from aiogram.filters import Command
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiogram.utils import markdown as md
