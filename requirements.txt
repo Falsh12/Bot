@@ -8,3 +8,4 @@ nest_asyncio
 pillow
 gunicorn
 flask
+gevent
