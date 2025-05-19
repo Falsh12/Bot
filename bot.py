@@ -42,7 +42,9 @@ from aiogram.exceptions import TelegramBadRequest
 from flask import Flask
 from threading import Thread
 
-# Flask-сервер app = Flask('')
+# Flask-сервер
+app = Flask('')
+
 @app.route('/')
 def home():
     print("Получен запрос к /") # Для отладки
