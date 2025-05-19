@@ -39,6 +39,22 @@ from datetime import datetime, timezone, timedelta
 nest_asyncio.apply()
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardRemove
 from aiogram.exceptions import TelegramBadRequest
+from flask import Flask
+from threading import Thread
+
+# Flask-сервер app = Flask('')
+@app.route('/')
+def home():
+    print("Получен запрос к /") # Для отладки
+    return "I'm alive"
+
+def run():
+    port = int(os.getenv("PORT", 8080)) # Используем PORT от Render
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
 
 # Создаем пул потоков для выполнения CPU-bound задач
 thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -995,6 +1011,7 @@ async def main():
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
     dp.include_router(router)
+    keep_alive()
     await set_bot_commands(bot)
     print("Бот запущен.")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
