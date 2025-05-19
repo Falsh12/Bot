@@ -6,6 +6,4 @@ aiogram
 aiofiles
 nest_asyncio
 pillow
-gunicorn
-flask
-gevent
+aiohttp
