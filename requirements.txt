@@ -7,3 +7,4 @@ aiofiles
 nest_asyncio
 pillow
 gunicorn
+flask
